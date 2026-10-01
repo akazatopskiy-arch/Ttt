@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>JARVIS</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000; color: #7bd8ff;
+    overflow: hidden; width: 100%; height: 100%;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none; touch-action: none;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+  canvas.dragging { cursor: grabbing; }
+
+  #status {
+    position: fixed; top: 20px; left: 20px;
+    font-size: 11px; letter-spacing: 0.3em;
+    color: rgba(120, 220, 255, 0.6);
+    text-transform: uppercase;
+    pointer-events: none; user-select: none;
+    transition: color 0.4s ease;
+    z-index: 10;
+  }
+  #status.thinking { color: rgba(255, 210, 130, 0.85); }
+  #status.speaking { color: rgba(180, 255, 220, 0.9); }
+  #status.error    { color: rgba(255, 130, 110, 0.9); }
+
+  #hint {
+    position: fixed;
+    bottom: 12%; left: 50%; transform: translateX(-50%);
+    font-size: 12px; letter-spacing: 0.15em;
+    color: rgba(120, 200, 240, 0.5);
+    text-align: center; white-space: nowrap;
+    pointer-events: none; user-select: none;
+    transition: opacity 0.6s ease;
+    z-index: 10;
+  }
+  #hint.hidden { opacity: 0; }
+
+  #heard, #said {
+    position: fixed;
+    left: 50%; transform: translateX(-50%);
+    max-width: 80vw; text-align: center;
+    pointer-events: none; user-select: none;
+    transition: opacity 0.5s ease;
+    opacity: 0; z-index: 10;
+    line-height: 1.4;
+  }
+  #heard {
+    bottom: 20%;
+    font-size: 13px; color: rgba(140, 210, 240, 0.6);
+  }
+  #said {
+    bottom: 14%;
+    font-size: 15px; color: rgba(190, 245, 255, 0.9);
+  }
+  #heard.show, #said.show { opacity: 1; }
+
+  #micdot {
+    position: fixed; top: 20px; right: 20px;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: rgba(120, 220, 255, 0.35);
+    box-shadow: 0 0 8px rgba(120, 220, 255, 0.4);
+    transition: all 0.3s ease;
+    z-index: 10;
+  }
+  #micdot.active {
+    background: rgba(120, 255, 200, 0.9);
+    box-shadow: 0 0 14px rgba(120, 255, 200, 0.9);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status">ЗАГРУЗКА</div>
+<div id="micdot"></div>
+<div id="hint">коснитесь экрана для активации</div>
+<div id="heard"></div>
+<div id="said"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ═══════════════════════════════════════════
+     КОНФИГ
+     ═══════════════════════════════════════════ */
+  const GEMINI_KEY = 'AIzaSyCQnMsFo-TLo2hptUa5n2-xQlQWm9p_MM4';
+  const GEMINI_MODEL = 'gemini-2.0-flash';
+  const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+
+  const SYSTEM_PROMPT = `Ты — JARVIS, персональный ИИ-ассистент (в духе фильма «Железный человек»).
+Правила:
+- Обращайся к пользователю "сэр".
+- Говори ТОЛЬКО по-русски.
+- Максимум 2-3 короткие фразы. Это голосовой диалог, не текст.
+- Никаких смайликов, списков, markdown, звёздочек.
+- Тон — вежливый, сдержанный, с легким сухим британским юмором.
+- Если не знаешь — честно скажи.
+- Не представляйся каждый раз заново.
+- Если просят время/дату — не можешь точно знать, скажи пользователю посмотреть на часы.`;
+
+  /* ═══════════════════════════════════════════
+     UI
+     ═══════════════════════════════════════════ */
+  const statusEl = document.getElementById('status');
+  const hintEl   = document.getElementById('hint');
+  const heardEl  = document.getElementById('heard');
+  const saidEl   = document.getElementById('said');
+  const micdot   = document.getElementById('micdot');
+
+  let heardTimer = null;
+  let saidTimer = null;
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || '';
+  }
+  function showHeard(text) {
+    heardEl.textContent = text;
+    heardEl.classList.add('show');
+    clearTimeout(heardTimer);
+    heardTimer = setTimeout(() => heardEl.classList.remove('show'), 4000);
+  }
+  function showSaid(text) {
+    saidEl.textContent = text;
+    saidEl.classList.add('show');
+    clearTimeout(saidTimer);
+    saidTimer = setTimeout(() => saidEl.classList.remove('show'), 6000);
+  }
+  function showHint(text) {
+    if (text) { hintEl.textContent = text; hintEl.classList.remove('hidden'); }
+    else hintEl.classList.add('hidden');
+  }
+  function showError(msg) {
+    setStatus('ОШИБКА', 'error');
+    showSaid(msg);
+    console.error('[JARVIS]', msg);
+  }
+
+  /* ═══════════════════════════════════════════
+     СФЕРА
+     ═══════════════════════════════════════════ */
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const TAU = Math.PI * 2;
+  let W, H, DPR, R, sizeK;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    R = Math.min(W, H) * 0.33;
+    sizeK = Math.min(1.6, Math.max(0.75, R / 170));
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', () => setTimeout(resize, 150));
+  resize();
+
+  function makeSphere(count, radius) {
+    const pts = [];
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < count; i++) {
+      const ny = 1 - (i / (count - 1)) * 2;
+      const r  = Math.sqrt(Math.max(0, 1 - ny * ny));
+      const th = golden * i;
+      const nx = Math.cos(th) * r;
+      const nz = Math.sin(th) * r;
+
+      const cR = radius * (2.6 + Math.random() * 2.0);
+      const cT = Math.random() * TAU;
+      const cP = Math.acos(2 * Math.random() - 1);
+
+      pts.push({
+        nx, ny, nz,
+        x: nx * radius, y: ny * radius, z: nz * radius,
+        phi: Math.acos(Math.max(-1, Math.min(1, ny))),
+        chaosX: Math.sin(cP) * Math.cos(cT) * cR,
+        chaosY: Math.cos(cP) * cR,
+        chaosZ: Math.sin(cP) * Math.sin(cT) * cR
+      });
+    }
+    return pts;
+  }
+
+  const LAYERS = [
+    { pts: makeSphere(800, 1.00), size: 1.6, alpha: 1.00, speed:  1.0,
+      colA: [ 90, 225, 255], colS: [ 40, 120, 200] },
+    { pts: makeSphere(500, 0.84), size: 1.2, alpha: 0.72, speed: -0.7,
+      colA: [  0, 170, 240], colS: [ 20,  90, 170] },
+    { pts: makeSphere(300, 0.68), size: 1.0, alpha: 0.48, speed:  0.5,
+      colA: [  0, 110, 210], colS: [ 15,  60, 140] }
+  ];
+
+  const S = {
+    BOOTING:   { wave: 0,    spin: 2.4, bright: 1.0,  colorT: 1, scale: 1.00, pointSize: 1.0,  pulse: 0, core: 0, think: 0, speak: 0 },
+    LISTENING: { wave: 0.65, spin: 1.0, bright: 1.0,  colorT: 1, scale: 1.00, pointSize: 1.0,  pulse: 1, core: 1, think: 0, speak: 0 },
+    THINKING:  { wave: 0.25, spin: 0.35,bright: 1.0,  colorT: 1, scale: 1.00, pointSize: 1.0,  pulse: 1, core: 1, think: 1, speak: 0 },
+    SPEAKING:  { wave: 0.75, spin: 1.1, bright: 1.05, colorT: 1, scale: 1.00, pointSize: 1.0,  pulse: 1, core: 1, think: 0, speak: 1 }
+  };
+
+  let mode = 'BOOTING';
+
+  let waveK = 0, spinK = 2.4, brightK = 1, colorT = 1, scaleK = 1;
+  let pointSizeK = 1, pulseK = 0, coreK = 0, thinkK = 0, speakK = 0;
+
+  let bootAssemble = 0;
+
+  let transActive = false, transStartT = 0, transDuration = 1.0;
+  const transFrom = {};
+
+  let corePulse = 0, shrinkK = 0, breatheK = 0;
+
+  function easeInOutCubic(x) {
+    if (x < 0) x = 0; if (x > 1) x = 1;
+    return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+  }
+  function win(v, a, b) {
+    if (v <= a) return 0; if (v >= b) return 1;
+    return (v - a) / (b - a);
+  }
+
+  function snapshot() {
+    transFrom.wave = waveK; transFrom.spin = spinK;
+    transFrom.bright = brightK; transFrom.colorT = colorT;
+    transFrom.scale = scaleK; transFrom.pointSize = pointSizeK;
+    transFrom.pulse = pulseK; transFrom.core = coreK;
+    transFrom.think = thinkK; transFrom.speak = speakK;
+  }
+
+  function setSphereState(next) {
+    if (next === mode) return;
+    mode = next;
+    snapshot();
+    transStartT = t;
+    transDuration = 1.2;
+    transActive = true;
+    // Импульс ядра при выходе из BOOTING или LISTENING
+    if (next === 'THINKING') corePulse = 0.4;
+  }
+
+  let coreRot = 0;
+  let t = 0;
+
+  const LERP_SPIN   = 0.06, LERP_BRIGHT = 0.04, LERP_COLOR = 0.05;
+  const LERP_SCALE  = 0.035, LERP_POINT = 0.035, LERP_PULSE = 0.05;
+  const LERP_CORE   = 0.05, LERP_THINK  = 0.06, LERP_SPEAK = 0.06;
+
+  let zoom = 1;
+  let rotX = -0.30, rotY = 0, velX = 0, velY = 0;
+  const AUTO_Y = 0.0018, AUTO_X = 0.0004;
+
+  // Голосовая амплитуда — пишет analyser, читает рендер
+  let voiceAmp = 0;   // 0..1
+
+  const pointers = new Map();
+  let dragging = false;
+  let downX = 0, downY = 0, downTime = 0, downInsideSphere = false, moved = false;
+  let lastX = 0, lastY = 0;
+  let pinchActive = false, pinchStartDist = 0, pinchStartZoom = 1;
+  const TAP_TIME = 350, TAP_DIST = 10, HIT_RADIUS_K = 1.15;
+
+  function surfaceRadius() { return R * scaleK * zoom; }
+
+  function pointerDown(e) {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      dragging = true; moved = false; pinchActive = false;
+      lastX = e.clientX; lastY = e.clientY;
+      downX = e.clientX; downY = e.clientY;
+      downTime = performance.now();
+      velX = velY = 0;
+      const dx = e.clientX - W/2, dy = e.clientY - H/2;
+      downInsideSphere = Math.hypot(dx, dy) < surfaceRadius() * HIT_RADIUS_K;
+      canvas.classList.add('dragging');
+    } else if (pointers.size === 2) {
+      dragging = false; moved = true; pinchActive = true;
+      const [p1, p2] = [...pointers.values()];
+      pinchStartDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      pinchStartZoom = zoom;
+      canvas.classList.remove('dragging');
+    }
+  }
+  function pointerMove(e) {
+    const p = pointers.get(e.pointerId); if (!p) return;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pointers.size === 2 && pinchActive) {
+      const [p1, p2] = [...pointers.values()];
+      const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      if (pinchStartDist > 10) {
+        zoom = Math.max(0.4, Math.min(2.5, pinchStartZoom * (dist / pinchStartDist)));
+      }
+      return;
+    }
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    const tdx = e.clientX - downX, tdy = e.clientY - downY;
+    if (tdx*tdx + tdy*tdy > TAP_DIST*TAP_DIST) moved = true;
+    rotY += dx * 0.006; rotX += dy * 0.006;
+    rotX = Math.max(-1.45, Math.min(1.45, rotX));
+    velY = dx * 0.006; velX = dy * 0.006;
+  }
+  function pointerUp(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size === 0) {
+      if (dragging) {
+        dragging = false;
+        canvas.classList.remove('dragging');
+        // тап по сфере не переключает режим в этом этапе — им активируется микрофон
+      }
+      pinchActive = false;
+    } else if (pointers.size === 1 && pinchActive) {
+      const [p] = [...pointers.values()];
+      lastX = p.x; lastY = p.y; downX = p.x; downY = p.y;
+      downTime = performance.now(); moved = true; dragging = true;
+      pinchActive = false;
+      canvas.classList.add('dragging');
+    }
+  }
+
+  canvas.addEventListener('pointerdown', pointerDown);
+  canvas.addEventListener('pointermove', pointerMove);
+  canvas.addEventListener('pointerup', pointerUp);
+  canvas.addEventListener('pointercancel', pointerUp);
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    zoom = Math.max(0.4, Math.min(2.5, zoom * (1 - e.deltaY * 0.001)));
+  }, { passive: false });
+
+  const drawList = [];
+
+  function renderSphere() {
+    t += 0.016;
+    const M = S[mode];
+
+    if (transActive) {
+      let p = (t - transStartT) / transDuration;
+      if (p >= 1) { p = 1; transActive = false; }
+      const e = easeInOutCubic(p);
+      waveK      = transFrom.wave      + (M.wave      - transFrom.wave)      * e;
+      spinK      = transFrom.spin      + (M.spin      - transFrom.spin)      * e;
+      brightK    = transFrom.bright    + (M.bright    - transFrom.bright)    * e;
+      colorT     = transFrom.colorT    + (M.colorT    - transFrom.colorT)    * e;
+      scaleK     = transFrom.scale     + (M.scale     - transFrom.scale)     * e;
+      pointSizeK = transFrom.pointSize + (M.pointSize - transFrom.pointSize) * e;
+      pulseK     = transFrom.pulse     + (M.pulse     - transFrom.pulse)     * e;
+      coreK      = transFrom.core      + (M.core      - transFrom.core)      * e;
+      thinkK     = transFrom.think     + (M.think     - transFrom.think)     * e;
+      speakK     = transFrom.speak     + (M.speak     - transFrom.speak)     * e;
+      corePulse *= 0.94;
+    } else {
+      spinK      += (M.spin      - spinK)      * LERP_SPIN;
+      brightK    += (M.bright    - brightK)    * LERP_BRIGHT;
+      colorT     += (M.colorT    - colorT)     * LERP_COLOR;
+      scaleK     += (M.scale     - scaleK)     * LERP_SCALE;
+      pointSizeK += (M.pointSize - pointSizeK) * LERP_POINT;
+      pulseK     += (M.pulse     - pulseK)     * LERP_PULSE;
+      coreK      += (M.core      - coreK)      * LERP_CORE;
+      thinkK     += (M.think     - thinkK)     * LERP_THINK;
+      speakK     += (M.speak     - speakK)     * LERP_SPEAK;
+      corePulse  *= 0.94;
+    }
+    if (corePulse < 0.001) corePulse = 0;
+
+    if (mode === 'BOOTING') {
+      bootAssemble += (1 - bootAssemble) * 0.012;
+      if (bootAssemble > 0.999) {
+        bootAssemble = 1;
+        setSphereState('LISTENING');
+      }
+    } else {
+      bootAssemble += (1 - bootAssemble) * 0.10;
+    }
+    const chaosAmt = 1 - bootAssemble;
+
+    coreRot += (0.004 + 0.016 * spinK) * coreK;
+
+    // Реакция на голос: расширение сферы
+    const voiceExpand = voiceAmp * 0.10;
+    const Re = R * scaleK * (1 + voiceExpand) * zoom;
+    const Rc = R * zoom;
+    const coreSizeMul = (0.35 + 0.65 * coreK) * (1 - chaosAmt * 0.6);
+    const coreGlowMul = 0.25 + 0.75 * coreK;
+
+    if (!dragging && pointers.size === 0) {
+      rotY += velY + AUTO_Y * spinK;
+      rotX += velX + AUTO_X * spinK;
+      velY *= 0.94; velX *= 0.94;
+      rotX += (-0.30 - rotX) * 0.004 * spinK;
+    }
+    const cx = Math.cos(rotX), sx = Math.sin(rotX);
+    const cy = Math.cos(rotY), sy = Math.sin(rotY);
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Ядро
+    const pulse = 0.5 + 0.5 * Math.sin(t * 2.2) * pulseK;
+    const coreR = Rc * (0.05 + 0.025 * pulse + 0.045 * corePulse) * coreSizeMul;
+    const coreBright = (0.35 + 0.65 * brightK + 0.55 * corePulse) * coreGlowMul * (1 - chaosAmt * 0.7);
+
+    const grad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(1, coreR * 7));
+    grad.addColorStop(0.00, `rgba(235, 255, 255, ${Math.min(1, 0.95 * coreBright)})`);
+    grad.addColorStop(0.20, `rgba( 90, 225, 255, ${Math.min(1, (0.55 + 0.30 * pulse) * coreBright)})`);
+    grad.addColorStop(0.55, `rgba(  0, 150, 255, ${Math.min(1, (0.18 + 0.12 * pulse) * coreBright)})`);
+    grad.addColorStop(1.00, 'rgba(  0,  80, 200, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(W/2, H/2, Math.max(1, coreR * 7), 0, TAU); ctx.fill();
+
+    // Диполь
+    ctx.save();
+    ctx.translate(W/2, H/2); ctx.rotate(coreRot);
+    const lobeDist = coreR * 1.6, lobeSize = Math.max(1, coreR * 3.2);
+    let lobe = ctx.createRadialGradient(-lobeDist, 0, 0, -lobeDist, 0, lobeSize);
+    lobe.addColorStop(0, `rgba(120, 235, 255, ${Math.min(1, (0.30 + 0.40 * corePulse) * coreBright)})`);
+    lobe.addColorStop(1, 'rgba(0, 150, 255, 0)');
+    ctx.fillStyle = lobe;
+    ctx.beginPath(); ctx.arc(-lobeDist, 0, lobeSize, 0, TAU); ctx.fill();
+    lobe = ctx.createRadialGradient(lobeDist, 0, 0, lobeDist, 0, lobeSize);
+    lobe.addColorStop(0, `rgba(120, 235, 255, ${Math.min(1, (0.30 + 0.40 * corePulse) * coreBright)})`);
+    lobe.addColorStop(1, 'rgba(0, 150, 255, 0)');
+    ctx.fillStyle = lobe;
+    ctx.beginPath(); ctx.arc(lobeDist, 0, lobeSize, 0, TAU); ctx.fill();
+    ctx.restore();
+
+    // Точки
+    drawList.length = 0;
+    const voiceWave = voiceAmp * 0.9;   // вклад голоса в амплитуду
+
+    for (let li = 0; li < LAYERS.length; li++) {
+      const L = LAYERS[li];
+      const pts = L.pts;
+      const lt = t * L.speed;
+
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i];
+
+        let wave = waveK * (
+          0.055 * Math.sin(pt.phi * 5.0 - lt * 2.0) +
+          0.035 * Math.sin(pt.nx * 6.0 + pt.nz * 4.0 + lt * 1.3)
+        );
+        wave += thinkK * 0.075 * Math.sin(pt.phi * 3.5 - t * 1.8);
+
+        // Реакция на голос — точки разлетаются по амплитуде
+        wave += voiceWave * 0.10 * Math.sin(pt.phi * 2.0 + t * 3.0);
+
+        const s = 1 + wave;
+        let bx = pt.x * s, by = pt.y * s, bz = pt.z * s;
+
+        if (chaosAmt > 0.001) {
+          bx = bx * (1 - chaosAmt) + pt.chaosX * chaosAmt;
+          by = by * (1 - chaosAmt) + pt.chaosY * chaosAmt;
+          bz = bz * (1 - chaosAmt) + pt.chaosZ * chaosAmt;
+        }
+
+        const x1 =  bx * cy - bz * sy;
+        const z1 =  bx * sy + bz * cy;
+        const y1 =  by * cx - z1 * sx;
+        const z2 =  by * sx + z1 * cx;
+
+        const persp = 3 / (3 + z2);
+        const screenX = W/2 + x1 * Re * persp;
+        const screenY = H/2 + y1 * Re * persp;
+        const depth = (1 - z2) * 0.5;
+
+        let bright = (0.30 + depth * 0.85) * brightK + wave * 3.0 + voiceAmp * 0.4;
+        if (bright < 0.08) bright = 0.08;
+        else if (bright > 1) bright = 1;
+        bright *= (1 - chaosAmt * 0.9);
+
+        const size = L.size * sizeK * pointSizeK * persp * (1 + wave * 2.2 + voiceAmp * 0.8) * (1 - chaosAmt * 0.5);
+        if (size < 0.35) continue;
+
+        let rC, gC, bC;
+        if (colorT < 0.55) {
+          const k = colorT / 0.55;
+          rC = L.colS[0] + (L.colA[0] - L.colS[0]) * k;
+          gC = L.colS[1] + (L.colA[1] - L.colS[1]) * k;
+          bC = L.colS[2] + (L.colA[2] - L.colS[2]) * k;
+        } else { rC = L.colA[0]; gC = L.colA[1]; bC = L.colA[2]; }
+
+        drawList.push({ x: screenX, y: screenY, z: z2, s: size,
+          a: L.alpha * bright, r: rC|0, g: gC|0, b: bC|0 });
+      }
+    }
+
+    drawList.sort((a, b) => a.z - b.z);
+
+    for (let i = 0; i < drawList.length; i++) {
+      const d = drawList[i];
+      const col = d.r + ',' + d.g + ',' + d.b;
+      ctx.fillStyle = 'rgba(' + col + ',' + (d.a * 0.22) + ')';
+      ctx.beginPath(); ctx.arc(d.x, d.y, d.s * 2.6, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(' + col + ',' + d.a + ')';
+      ctx.beginPath(); ctx.arc(d.x, d.y, d.s, 0, TAU); ctx.fill();
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ═══════════════════════════════════════════
+     ЗВУК — AnalyserNode для реакции на голос
+     ═══════════════════════════════════════════ */
+  let audioCtx = null;
+  let analyser = null;
+  let analyserData = null;
+  let micStream = null;
+
+  async function initMic() {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    src.connect(analyser);
+    analyserData = new Uint8Array(analyser.fftSize);
+    micdot.classList.add('active');
+  }
+
+  function updateVoiceAmp() {
+    if (!analyser || !analyserData) { voiceAmp *= 0.9; return; }
+    // Во время SPEAKING — не читаем микрофон (feedback loop)
+    if (mode === 'SPEAKING') {
+      // Фейковая амплитуда речи
+      const fake = 0.35 + 0.25 * Math.sin(t * 7) + 0.20 * Math.sin(t * 13.7) + 0.15 * Math.sin(t * 2.3);
+      voiceAmp = Math.max(0.05, fake);
+      return;
+    }
+    analyser.getByteTimeDomainData(analyserData);
+    let sum = 0;
+    for (let i = 0; i < analyserData.length; i++) {
+      const v = (analyserData[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / analyserData.length);
+    const amp = Math.min(1, rms * 8);
+    voiceAmp = voiceAmp * 0.7 + amp * 0.3;
+  }
+
+  /* ═══════════════════════════════════════════
+     SPEECH RECOGNITION — wake word «Джарвис»
+     ═══════════════════════════════════════════ */
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let recognitionWanted = false;
+  let expectingQuery = false;
+  let expectingTimer = null;
+  let isProcessing = false;   // THINKING/SPEAKING
+  let ttsSpeaking = false;
+
+  function containsWake(text) {
+    const t = text.toLowerCase().replace(/ё/g, 'е');
+    return /джарвис|джарвиз|jarvis|jarvi/.test(t);
+  }
+  function extractAfterWake(text) {
+    const t = text.replace(/ё/g, 'е');
+    const m = t.match(/джарвис[ауиы]?[,.\s]*([\s\S]*)/i) || t.match(/jarvis[,.\s]*([\s\S]*)/i);
+    return m ? m[1] : '';
+  }
+
+  function initRecognition() {
+    if (!SR) {
+      showError('Браузер не поддерживает распознавание речи. Откройте в Chrome или Edge.');
+      return false;
+    }
+    recognition = new SR();
+    recognition.lang = 'ru-RU';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (e) => {
+      if (isProcessing || ttsSpeaking) return;
+      let interim = '';
+      let final = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const tr = e.results[i][0].transcript;
+        if (e.results[i].isFinal) final += tr + ' ';
+        else interim += tr;
+      }
+
+      if (interim) {
+        showHeard(interim.trim());
+      }
+
+      if (final.trim()) {
+        handleFinal(final.trim());
+      }
+    };
+
+    recognition.onerror = (e) => {
+      if (e.error === 'no-speech' || e.error === 'aborted') return;
+      if (e.error === 'not-allowed') {
+        showError('Доступ к микрофону запрещён. Разрешите его в настройках браузера и перезагрузите.');
+        recognitionWanted = false;
+        return;
+      }
+      if (e.error === 'network') {
+        console.warn('[JARVIS] сеть распознавания недоступна');
+        return;
+      }
+      console.warn('[JARVIS] ошибка распознавания:', e.error);
+    };
+
+    recognition.onend = () => {
+      if (recognitionWanted) {
+        setTimeout(() => {
+          if (recognitionWanted && !ttsSpeaking) {
+            try { recognition.start(); } catch(err) {}
+          }
+        }, 250);
+      }
+    };
+
+    return true;
+  }
+
+  function startRecognition() {
+    if (!recognition) return;
+    recognitionWanted = true;
+    try { recognition.start(); } catch(e) {}
+  }
+  function stopRecognition() {
+    recognitionWanted = false;
+    try { recognition.stop(); } catch(e) {}
+  }
+
+  function handleFinal(text) {
+    const lower = text.toLowerCase();
+    if (containsWake(lower)) {
+      const after = extractAfterWake(text).trim();
+      if (after.length > 1) {
+        processQuery(after);
+      } else {
+        // Только «Джарвис» — отвечаем «Да, сэр?» и ждём фразу
+        expectingQuery = true;
+        clearTimeout(expectingTimer);
+        expectingTimer = setTimeout(() => { expectingQuery = false; }, 8000);
+        speak('Да, сэр?');
+      }
+    } else if (expectingQuery) {
+      expectingQuery = false;
+      clearTimeout(expectingTimer);
+      processQuery(text);
+    }
+  }
+
+  /* ═══════════════════════════════════════════
+     GEMINI — мозг
+     ═══════════════════════════════════════════ */
+  let history = [];  // { role: 'user' | 'model', parts: [{ text }] }
+
+  async function askGemini(userText) {
+    const contents = history.concat([{ role: 'user', parts: [{ text: userText }] }]);
+    const body = {
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: contents,
+      generationConfig: {
+        temperature: 0.85,
+        maxOutputTokens: 200,
+        topP: 0.95
+      }
+    };
+    const r = await fetch(GEMINI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      console.error('[JARVIS] Gemini error', r.status, errText);
+      if (r.status === 400 || r.status === 403) throw new Error('API_KEY');
+      if (r.status === 429) throw new Error('RATE_LIMIT');
+      throw new Error('NETWORK');
+    }
+    const data = await r.json();
+    const cand = data && data.candidates && data.candidates[0];
+    const txt = cand && cand.content && cand.content.parts && cand.content.parts[0]
+              && cand.content.parts[0].text;
+    if (!txt) throw new Error('EMPTY');
+    return txt.trim();
+  }
+
+  /* ═══════════════════════════════════════════
+     TTS — голос Джарвиса (русский)
+     ═══════════════════════════════════════════ */
+  let ruVoice = null;
+  function pickVoice() {
+    const voices = speechSynthesis.getVoices();
+    if (!voices.length) return;
+    const ru = voices.filter(v => v.lang && v.lang.toLowerCase().startsWith('ru'));
+    if (ru.length) {
+      ruVoice = ru.find(v => /google/i.test(v.name))
+             || ru.find(v => /irina|milena|yandex/i.test(v.name))
+             || ru[0];
+    } else {
+      ruVoice = null;
+      console.warn('[JARVIS] русский голос не найден, будет использован голос по умолчанию');
+    }
+  }
+  if ('speechSynthesis' in window) {
+    speechSynthesis.onvoiceschanged = pickVoice;
+    pickVoice();
+    setTimeout(pickVoice, 300);
+  }
+
+  function speak(text) {
+    return new Promise((resolve) => {
+      if (!('speechSynthesis' in window)) { resolve(); return; }
+
+      // Пауза распознавания, чтобы микрофон не поймал наш же голос
+      ttsSpeaking = true;
+      try { recognition && recognition.stop(); } catch(e) {}
+
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ru-RU';
+      u.rate = 0.98;
+      u.pitch = 1.0;
+      u.volume = 1.0;
+      if (ruVoice) u.voice = ruVoice;
+
+      let finished = false;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        ttsSpeaking = false;
+        // Небольшая задержка перед возобновлением
+        setTimeout(() => {
+          if (recognitionWanted && !isProcessing) {
+            try { recognition.start(); } catch(e) {}
+          }
+        }, 300);
+        resolve();
+      };
+
+      u.onend = done;
+      u.onerror = done;
+
+      // Защита от зависания (если onend не сработает)
+      setTimeout(done, Math.max(3000, text.length * 200));
+
+      setSphereState('SPEAKING');
+      speechSynthesis.speak(u);
+    });
+  }
+
+  /* ═══════════════════════════════════════════
+     ORCHESTRATOR — обработка запроса
+     ═══════════════════════════════════════════ */
+  async function processQuery(userText) {
+    if (isProcessing) return;
+    isProcessing = true;
+
+    showHeard(userText);
+    setStatus('ДУМАЮ', 'thinking');
+    setSphereState('THINKING');
+
+    let reply = '';
+    try {
+      reply = await askGemini(userText);
+      history.push({ role: 'user', parts: [{ text: userText }] });
+      history.push({ role: 'model', parts: [{ text: reply }] });
+      if (history.length > 20) history = history.slice(-20);
+    } catch (e) {
+      console.error(e);
+      if (e.message === 'API_KEY') {
+        reply = 'Ошибка доступа к моему ядру, сэр. Проверьте ключ API.';
+      } else if (e.message === 'RATE_LIMIT') {
+        reply = 'Слишком много запросов, сэр. Дайте мне минуту.';
+      } else {
+        reply = 'Связь с моим ядром прервана, сэр. Проверьте интернет.';
+      }
+    }
+
+    showSaid(reply);
+    setStatus('ОТВЕЧАЮ', 'speaking');
+    await speak(reply);
+
+    isProcessing = false;
+    if (recognitionWanted) {
+      setStatus('СЛУШАЮ', '');
+      setSphereState('LISTENING');
+    }
+  }
+
+  /* ═══════════════════════════════════════════
+     BOOT
+     ═══════════════════════════════════════════ */
+  let booted = false;
+
+  async function activate() {
+    if (booted) return;
+    booted = true;
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('NO_GETUSERMEDIA');
+      }
+      await initMic();
+    } catch (e) {
+      console.error(e);
+      if (e.message === 'NO_GETUSERMEDIA' || e.name === 'NotFoundError') {
+        showError('Микрофон не найден. Подключите микрофон и перезагрузите.');
+      } else if (e.name === 'NotAllowedError') {
+        showError('Доступ к микрофону запрещён. Разрешите в адресной строке и перезагрузите.');
+      } else {
+        showError('Не удалось получить доступ к микрофону.');
+      }
+      return;
+    }
+
+    if (!initRecognition()) {
+      return;
+    }
+
+    // Прогреваем TTS (некоторые браузеры требуют жест пользователя)
+    try {
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      speechSynthesis.speak(u);
+    } catch (e) {}
+
+    setStatus('СЛУШАЮ', '');
+    showHint('скажите «Джарвис»');
+    setTimeout(() => showHint(''), 6000);
+
+    startRecognition();
+  }
+
+  canvas.addEventListener('pointerdown', () => {
+    if (!booted) {
+      showHint('');
+      activate();
+    }
+  });
+  window.addEventListener('touchstart', () => {
+    if (!booted) { showHint(''); activate(); }
+  }, { passive: true, once: false });
+
+  // Главный цикл
+  function frame() {
+    updateVoiceAmp();
+    renderSphere();
+    requestAnimationFrame(frame);
+  }
+  frame();
+
+  // Если через 3 сек не активировали — мягко напомним
+  setTimeout(() => {
+    if (!booted) showHint('коснитесь экрана для активации');
+  }, 3000);
+})();
+</script>
+</body>
+</html>
